@@ -3,7 +3,7 @@ import pandas as pd
 import time
 import io
 import os
-import requests # 我们现在主要靠这个库
+import requests
 import json
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
@@ -34,13 +34,14 @@ SYSTEM_PROMPT = """
 【改写方案B】: <利益型标题>
 """
 
-# ================= 2. 验证逻辑 =================
+# ================= 2. 验证逻辑 (从Secret读取) =================
 
 def get_valid_codes():
     """从 Secrets 中读取并清洗卡密列表"""
     if "VALID_CODES" not in st.secrets:
-        st.error("⚠️ 配置错误：未找到 VALID_CODES，请检查 Secrets。")
+        st.error("⚠️ 系统配置错误：未找到卡密列表 (VALID_CODES)，请在后台 Secrets 中配置。")
         return []
+    
     raw_str = st.secrets["VALID_CODES"]
     cleaned_str = raw_str.replace('\n', ',')
     code_list = [code.strip() for code in cleaned_str.split(',') if code.strip()]
@@ -49,6 +50,7 @@ def get_valid_codes():
 def check_auth():
     """处理侧边栏登录逻辑"""
     st.sidebar.header("🔐 会员登录")
+    
     if "is_logged_in" not in st.session_state:
         st.session_state.is_logged_in = False
     
@@ -59,7 +61,7 @@ def check_auth():
             st.rerun()
         return True
 
-    user_input = st.sidebar.text_input("请输入卡密 / 激活码", type="password")
+    user_input = st.sidebar.text_input("请输入卡密 / 激活码", type="password", help="请填写您购买的卡密")
     btn = st.sidebar.button("验证")
     
     if btn:
@@ -67,14 +69,19 @@ def check_auth():
         valid_codes = get_valid_codes()
         clean_input = user_input.strip()
         
+        # 管理员登录
         if clean_input == admin_pwd:
-            st.sidebar.success(f"👮 管理员认证成功 (生效卡密: {len(valid_codes)}个)")
+            st.sidebar.success("👮 管理员认证成功")
+            st.sidebar.info(f"当前生效卡密: {len(valid_codes)} 个")
+            
+        # 卡密登录
         elif clean_input in valid_codes:
             st.session_state.is_logged_in = True
             st.sidebar.success("验证成功！")
             st.rerun()
         else:
-            st.sidebar.error("❌ 无效的卡密")
+            st.sidebar.error("❌ 无效的卡密，请检查输入")
+            
     return False
 
 # ================= 3. 辅助功能 =================
@@ -91,31 +98,30 @@ def get_chinese_font():
                 with open(font_path, "wb") as f:
                     f.write(r.content)
         except:
-            st.warning("字体下载失败，图表可能显示方框。")
+            st.warning("字体下载失败，可能会导致图表中文显示方框。")
     return font_path
 
-# 🔥🔥🔥 核心修改：使用 Requests 直接调用第三方 API 🔥🔥🔥
+# 🔥🔥🔥 核心修复：适配第三方中转 API (sk-开头) 🔥🔥🔥
 def analyze_note(api_key, title, likes, ctr):
     """
-    不再使用 google.generativeai 库，
-    而是直接向 api.gptsapi.net 发送 HTTP 请求。
+    使用 requests 调用第三方接口，同时在 Header 中传递 Bearer Token
     """
-    # 你的第三方中转地址 (Gemini 1.5 Flash)
-    url = f"https://api.gptsapi.net/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+    # 1. 构造 URL (Gemini 1.5 Flash)
+    url = "https://api.gptsapi.net/v1beta/models/gemini-1.5-flash:generateContent"
     
-    # 构造请求头
-    headers = {'Content-Type': 'application/json'}
+    # 2. 构造请求头 (关键：这里加上 Authorization)
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {api_key}', # 适配 sk- 开头的 Key
+        'x-goog-api-key': api_key # 双重保险，有的渠道认这个
+    }
     
-    # 构造提示词内容
+    # 3. 构造提示词和数据
     user_prompt = f"笔记标题：{title}\n数据：点赞 {likes}, 点击率 {ctr}\n请诊断。"
     
-    # 构造 JSON 数据包 (完全符合 Gemini 官方格式)
     payload = {
-        "system_instruction": {
-            "parts": {"text": SYSTEM_PROMPT}
-        },
         "contents": [{
-            "parts": [{"text": user_prompt}]
+            "parts": [{"text": SYSTEM_PROMPT + "\n---\n" + user_prompt}]
         }]
     }
 
@@ -126,12 +132,18 @@ def analyze_note(api_key, title, likes, ctr):
         # 解析结果
         if response.status_code == 200:
             result_json = response.json()
-            # 提取文本内容
             try:
-                text = result_json['candidates'][0]['content']['parts'][0]['text']
-                return text
+                if 'candidates' in result_json:
+                    text = result_json['candidates'][0]['content']['parts'][0]['text']
+                    return text
+                else:
+                    return f"API返回结构异常: {result_json}"
             except:
                 return f"解析失败: {response.text}"
+        
+        # 针对 401 错误的详细提示
+        elif response.status_code == 401:
+            return f"❌ 认证失败 (401): Key 不正确。请检查 Secrets 中是否有多余空格或引号。"
         else:
             return f"API请求失败 (Code {response.status_code}): {response.text}"
             
@@ -201,11 +213,10 @@ def create_pdf(df, analysis_results, charts_buffer):
 if check_auth():
     st.title("🏥 小红书账号 ICU 急救站 (第三方API版)")
     
-    # 读取 Key
     if "GOOGLE_API_KEY" in st.secrets:
         api_key = st.secrets["GOOGLE_API_KEY"]
     else:
-        st.error("⚠️ 未配置 GOOGLE_API_KEY")
+        st.error("⚠️ 系统未配置 API Key，请在 Secrets 中添加 GOOGLE_API_KEY")
         st.stop()
 
     uploaded_file = st.file_uploader("上传 Excel/CSV 数据表", type=['xlsx', 'csv'])
@@ -232,17 +243,18 @@ if check_auth():
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 results = []
-                process_df = df.head(5) # 演示前5条
+                
+                # 演示前5条 (可删除 .head(5) 跑全量)
+                process_df = df.head(5)
                 
                 for idx, row in process_df.iterrows():
                     status_text.text(f"正在诊断: {row[title_col]}...")
                     
-                    # 🔥 调用修改后的分析函数，传入 api_key
+                    # 调用修复后的函数
                     res = analyze_note(api_key, row[title_col], row[likes_col], "未知")
                     
                     results.append({"title": row[title_col], "result": res})
                     progress_bar.progress((idx + 1) / len(process_df))
-                    # 这里的sleep可以适当减少，因为第三方并发可能高一点，但保险起见留着
                     time.sleep(0.5) 
                     
                 status_text.success("诊断完成！")
@@ -252,12 +264,13 @@ if check_auth():
                 with col_chart:
                     st.subheader("📊 互动趋势")
                     
-                    # 字体修复
+                    # === 核心修复：图表字体处理 ===
                     font_path = get_chinese_font()
                     if os.path.exists(font_path):
                         fm.fontManager.addfont(font_path)
                         plt.rcParams['font.family'] = fm.FontProperties(fname=font_path).get_name()
                     plt.rcParams['axes.unicode_minus'] = False 
+                    # ===========================
 
                     fig, ax = plt.subplots(figsize=(6, 4))
                     sns.barplot(x=process_df[likes_col], y=process_df[title_col].str[:8], ax=ax, palette="viridis")
@@ -282,7 +295,7 @@ if check_auth():
                 )
                 
         except Exception as e:
-            st.error(f"出错: {e}")
+            st.error(f"处理数据时出错: {e}")
 else:
     st.markdown("# 👋 欢迎来到小红书账号急救站")
     st.info("👈 请在左侧输入卡密解锁。")
