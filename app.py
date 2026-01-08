@@ -34,12 +34,12 @@ SYSTEM_PROMPT = """
 【改写方案B】: <利益型标题>
 """
 
-# ================= 2. 验证逻辑 (从Secret读取) =================
+# ================= 2. 验证逻辑 =================
 
 def get_valid_codes():
     """从 Secrets 中读取并清洗卡密列表"""
     if "VALID_CODES" not in st.secrets:
-        st.error("⚠️ 系统配置错误：未找到卡密列表 (VALID_CODES)，请在后台 Secrets 中配置。")
+        st.error("⚠️ 系统配置错误：未找到卡密列表 (VALID_CODES)。")
         return []
     
     raw_str = st.secrets["VALID_CODES"]
@@ -69,19 +69,15 @@ def check_auth():
         valid_codes = get_valid_codes()
         clean_input = user_input.strip()
         
-        # 管理员登录
         if clean_input == admin_pwd:
             st.sidebar.success("👮 管理员认证成功")
             st.sidebar.info(f"当前生效卡密: {len(valid_codes)} 个")
-            
-        # 卡密登录
         elif clean_input in valid_codes:
             st.session_state.is_logged_in = True
             st.sidebar.success("验证成功！")
             st.rerun()
         else:
-            st.sidebar.error("❌ 无效的卡密，请检查输入")
-            
+            st.sidebar.error("❌ 无效的卡密")
     return False
 
 # ================= 3. 辅助功能 =================
@@ -98,54 +94,59 @@ def get_chinese_font():
                 with open(font_path, "wb") as f:
                     f.write(r.content)
         except:
-            st.warning("字体下载失败，可能会导致图表中文显示方框。")
+            st.warning("字体下载失败，图表可能显示异常。")
     return font_path
 
-# 🔥🔥🔥 核心修复：适配第三方中转 API (sk-开头) 🔥🔥🔥
+# 🔥🔥🔥 核心修复：完全匹配你的 Curl 命令 🔥🔥🔥
 def analyze_note(api_key, title, likes, ctr):
     """
-    使用 requests 调用第三方接口，同时在 Header 中传递 Bearer Token
+    严格按照用户提供的 curl 格式调用 Gemini 3 Flash Preview
     """
-    # 1. 构造 URL (Gemini 1.5 Flash)
-    url = "https://api.gptsapi.net/v1beta/models/gemini-1.5-flash:generateContent"
+    # 1. 严格使用你提供的 URL (注意模型名称是 gemini-3-flash-preview)
+    url = "https://api.gptsapi.net/v1beta/models/gemini-3-flash-preview:generateContent"
     
-    # 2. 构造请求头 (关键：这里加上 Authorization)
+    # 2. 严格使用你提供的 Headers
     headers = {
-        'Content-Type': 'application/json',
-        'Authorization': f'Bearer {api_key}', # 适配 sk- 开头的 Key
-        'x-goog-api-key': api_key # 双重保险，有的渠道认这个
+        'x-goog-api-key': api_key, # 这里对应 curl 中的 YOUR_API_KEY
+        'Content-Type': 'application/json'
     }
     
-    # 3. 构造提示词和数据
-    user_prompt = f"笔记标题：{title}\n数据：点赞 {likes}, 点击率 {ctr}\n请诊断。"
+    # 构造完整的 Prompt
+    full_prompt = f"{SYSTEM_PROMPT}\n\n---\n待诊断笔记：\n标题：{title}\n数据：点赞 {likes}, 点击率 {ctr}"
     
+    # 3. 严格构造 Body 数据结构
     payload = {
-        "contents": [{
-            "parts": [{"text": SYSTEM_PROMPT + "\n---\n" + user_prompt}]
-        }]
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "text": full_prompt
+                    }
+                ]
+            }
+        ]
     }
 
     try:
         # 发送请求
         response = requests.post(url, headers=headers, json=payload, timeout=30)
         
-        # 解析结果
         if response.status_code == 200:
             result_json = response.json()
             try:
-                if 'candidates' in result_json:
-                    text = result_json['candidates'][0]['content']['parts'][0]['text']
-                    return text
-                else:
-                    return f"API返回结构异常: {result_json}"
+                # 提取 Google 格式的返回结果
+                text = result_json['candidates'][0]['content']['parts'][0]['text']
+                return text
             except:
                 return f"解析失败: {response.text}"
         
-        # 针对 401 错误的详细提示
-        elif response.status_code == 401:
-            return f"❌ 认证失败 (401): Key 不正确。请检查 Secrets 中是否有多余空格或引号。"
+        elif response.status_code == 404:
+            return f"❌ 404 错误: 模型名称不对或接口路径变动。\n当前请求URL: {url}"
+        elif response.status_code == 400:
+            return f"❌ 400 错误: 数据格式不对。\nAPI返回: {response.text}"
         else:
-            return f"API请求失败 (Code {response.status_code}): {response.text}"
+            return f"API请求失败 ({response.status_code}): {response.text}"
             
     except Exception as e:
         return f"连接错误: {str(e)}"
@@ -163,21 +164,18 @@ def create_pdf(df, analysis_results, charts_buffer):
     else:
         font_name = 'Helvetica'
     
-    # 封面
     c.setFillColor(HexColor('#FF2442'))
     c.rect(0, height - 100, width, 100, fill=1, stroke=0)
     c.setFillColor(HexColor('#FFFFFF'))
     c.setFont(font_name, 24)
     c.drawString(30, height - 60, "小红书账号深度诊断报告")
     
-    # 插入图表
     if charts_buffer:
         charts_buffer.seek(0)
         with open("temp_chart.png", "wb") as f:
             f.write(charts_buffer.getbuffer())
         c.drawImage("temp_chart.png", 30, height - 450, width=500, height=280)
     
-    # 写入文字结果
     c.setFillColor(HexColor('#000000'))
     c.setFont(font_name, 16)
     y = height - 480
@@ -211,12 +209,12 @@ def create_pdf(df, analysis_results, charts_buffer):
 # ================= 4. 主程序入口 =================
 
 if check_auth():
-    st.title("🏥 小红书账号 ICU 急救站 (第三方API版)")
+    st.title("🏥 小红书账号 ICU 急救站 (Gemini 3 Preview)")
     
     if "GOOGLE_API_KEY" in st.secrets:
         api_key = st.secrets["GOOGLE_API_KEY"]
     else:
-        st.error("⚠️ 系统未配置 API Key，请在 Secrets 中添加 GOOGLE_API_KEY")
+        st.error("⚠️ 未配置 GOOGLE_API_KEY")
         st.stop()
 
     uploaded_file = st.file_uploader("上传 Excel/CSV 数据表", type=['xlsx', 'csv'])
@@ -243,16 +241,11 @@ if check_auth():
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 results = []
-                
-                # 演示前5条 (可删除 .head(5) 跑全量)
-                process_df = df.head(5)
+                process_df = df.head(5) 
                 
                 for idx, row in process_df.iterrows():
                     status_text.text(f"正在诊断: {row[title_col]}...")
-                    
-                    # 调用修复后的函数
                     res = analyze_note(api_key, row[title_col], row[likes_col], "未知")
-                    
                     results.append({"title": row[title_col], "result": res})
                     progress_bar.progress((idx + 1) / len(process_df))
                     time.sleep(0.5) 
@@ -264,13 +257,11 @@ if check_auth():
                 with col_chart:
                     st.subheader("📊 互动趋势")
                     
-                    # === 核心修复：图表字体处理 ===
                     font_path = get_chinese_font()
                     if os.path.exists(font_path):
                         fm.fontManager.addfont(font_path)
                         plt.rcParams['font.family'] = fm.FontProperties(fname=font_path).get_name()
                     plt.rcParams['axes.unicode_minus'] = False 
-                    # ===========================
 
                     fig, ax = plt.subplots(figsize=(6, 4))
                     sns.barplot(x=process_df[likes_col], y=process_df[title_col].str[:8], ax=ax, palette="viridis")
@@ -295,7 +286,7 @@ if check_auth():
                 )
                 
         except Exception as e:
-            st.error(f"处理数据时出错: {e}")
+            st.error(f"出错: {e}")
 else:
     st.markdown("# 👋 欢迎来到小红书账号急救站")
     st.info("👈 请在左侧输入卡密解锁。")
