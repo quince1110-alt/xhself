@@ -5,6 +5,8 @@ import time
 import io
 import os
 import requests
+import hashlib
+import datetime
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
@@ -13,14 +15,14 @@ from reportlab.lib.colors import HexColor
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# ================= 配置区域 =================
+# ================= 1. 基础配置 =================
 st.set_page_config(
     page_title="小红书账号ICU急救站",
     page_icon="🏥",
     layout="wide"
 )
 
-# 系统提示词 (毒舌版)
+# 毒舌专家提示词
 SYSTEM_PROMPT = """
 # Role: 小红书爆款诊断专家
 你是一名拥有百万粉丝操盘经验的小红书运营专家。你说话风格犀利、毒舌、拒绝废话，只看数据和人性。
@@ -33,220 +35,251 @@ SYSTEM_PROMPT = """
 【改写方案B】: <利益型标题>
 """
 
-# ================= 辅助函数：字体处理 =================
+# ================= 2. 安全与授权模块 (核心) =================
+
+def get_daily_token():
+    """生成今日动态卡密 (算法：MD5(盐值 + 日期))"""
+    if "SECRET_SALT" not in st.secrets:
+        st.error("配置错误：请在 Secrets 中设置 SECRET_SALT")
+        return None
+        
+    salt = st.secrets["SECRET_SALT"]
+    today = datetime.datetime.now().strftime("%Y%m%d")
+    raw = f"{salt}{today}"
+    # 取哈希的前6位作为卡密
+    return hashlib.md5(raw.encode()).hexdigest()[:6]
+
+def check_auth():
+    """处理侧边栏登录逻辑"""
+    st.sidebar.header("🔐 会员登录")
+    
+    # 初始化登录状态
+    if "is_logged_in" not in st.session_state:
+        st.session_state.is_logged_in = False
+    
+    # 如果已登录，显示状态和退出按钮
+    if st.session_state.is_logged_in:
+        st.sidebar.success("✅ 已验证身份")
+        if st.sidebar.button("退出登录"):
+            st.session_state.is_logged_in = False
+            st.rerun()
+        return True
+
+    # 如果未登录，显示输入框
+    user_input = st.sidebar.text_input("请输入今日卡密", type="password", help="请联系管理员获取")
+    btn = st.sidebar.button("验证")
+    
+    if btn:
+        admin_pwd = st.secrets.get("ADMIN_PASSWORD", "admin")
+        daily_token = get_daily_token()
+        
+        # 情况A：管理员登录 (显示今日卡密)
+        if user_input == admin_pwd:
+            st.sidebar.success("👮 管理员认证成功")
+            st.sidebar.markdown("### 🔑 今日卡密 (请复制给用户):")
+            st.sidebar.code(daily_token, language="text")
+            # 管理员也可以选择直接进入系统
+            # st.session_state.is_logged_in = True
+            # st.rerun()
+            
+        # 情况B：用户使用卡密登录
+        elif user_input == daily_token:
+            st.session_state.is_logged_in = True
+            st.sidebar.success("验证成功！")
+            st.rerun()
+            
+        # 情况C：密码错误
+        else:
+            st.sidebar.error("❌ 卡密无效或已过期")
+            
+    return False
+
+# ================= 3. 辅助功能 (字体/PDF/AI) =================
+
+@st.cache_resource
 def get_chinese_font():
-    """下载中文字体，确保PDF不乱码"""
+    """下载中文字体防止乱码"""
     font_path = "SimHei.ttf"
-    # 如果本地没有字体，从网上下载一个开源字体 (这里使用 NotoSansSC 的一个精简版或者类似)
-    # 为了演示稳定，我们使用一个托管的字体链接，或者你也可以手动上传 SimHei.ttf 到你的 GitHub
     if not os.path.exists(font_path):
-        with st.spinner("正在初始化字体资源（首次运行需下载）..."):
-            # 这里使用一个常用的开源中文字体链接，如果失效请手动上传 SimHei.ttf 到仓库
-            url = "https://github.com/StellarCN/scp_zh/raw/master/fonts/SimHei.ttf"
-            try:
-                r = requests.get(url)
-                with open(font_path, "wb") as f:
-                    f.write(r.content)
-            except:
-                st.error("字体下载失败，请在 GitHub 仓库中手动上传一个 SimHei.ttf 文件")
+        # 使用一个开源字体链接
+        url = "https://github.com/StellarCN/scp_zh/raw/master/fonts/SimHei.ttf"
+        try:
+            r = requests.get(url)
+            with open(font_path, "wb") as f:
+                f.write(r.content)
+        except:
+            pass
     return font_path
 
-# ================= 核心功能：AI 分析 =================
 def analyze_note(model, title, likes, ctr):
-    prompt = f"""
-    笔记标题：{title}
-    数据：点赞 {likes}, 点击率 {ctr}
-    请按要求诊断。
-    """
+    """调用 API 分析"""
+    prompt = f"笔记标题：{title}\n数据：点赞 {likes}, 点击率 {ctr}\n请诊断。"
     try:
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
-        return f"诊断失败: {str(e)}"
+        return f"AI 响应错误: {str(e)}"
 
-# ================= 核心功能：生成 PDF =================
 def create_pdf(df, analysis_results, charts_buffer):
+    """生成 PDF 报告"""
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     width, height = A4
     
-    # 注册字体
     font_path = get_chinese_font()
     if os.path.exists(font_path):
         pdfmetrics.registerFont(TTFont('SimHei', font_path))
         font_name = 'SimHei'
     else:
-        font_name = 'Helvetica' # 降级方案
+        font_name = 'Helvetica'
     
-    # --- 封面 ---
-    c.setFillColor(HexColor('#FF2442')) # 小红书红
+    # 封面
+    c.setFillColor(HexColor('#FF2442'))
     c.rect(0, height - 100, width, 100, fill=1, stroke=0)
-    
     c.setFillColor(HexColor('#FFFFFF'))
     c.setFont(font_name, 24)
     c.drawString(30, height - 60, "小红书账号深度诊断报告")
-    c.setFont(font_name, 14)
-    c.drawString(30, height - 85, "Generated by AI Strategy Studio")
     
-    # --- 插入图表 ---
-    c.setFillColor(HexColor('#000000'))
-    c.setFont(font_name, 16)
-    c.drawString(30, height - 150, "一、数据可视化诊断")
-    
-    # 从 buffer 读取图表并画入 PDF
+    # 插入图表
     if charts_buffer:
         charts_buffer.seek(0)
-        # Reportlab 插入图片需要文件路径或特殊处理，这里简化逻辑
-        # 为了兼容性，我们先把 matplotlib 图片存临时文件
         with open("temp_chart.png", "wb") as f:
             f.write(charts_buffer.getbuffer())
         c.drawImage("temp_chart.png", 30, height - 450, width=500, height=280)
     
-    # --- AI 诊断列表 ---
+    # 写入文字结果
+    c.setFillColor(HexColor('#000000'))
     c.setFont(font_name, 16)
-    y_position = height - 480
-    c.drawString(30, y_position, "二、AI 毒舌急救方案")
-    y_position -= 30
-    
+    y = height - 480
+    c.drawString(30, y, "二、AI 毒舌急救方案")
+    y -= 30
     c.setFont(font_name, 10)
     
     for item in analysis_results:
-        if y_position < 100: # 换页
+        if y < 100:
             c.showPage()
             c.setFont(font_name, 10)
-            y_position = height - 50
+            y = height - 50
             
-        # 解析 AI 返回的文本 (简单处理)
-        text_lines = item['result'].split('\n')
-        
         # 绘制背景块
         c.setFillColor(HexColor('#F5F5F5'))
-        c.rect(20, y_position - 70, width - 40, 80, fill=1, stroke=0)
+        c.rect(20, y - 70, width - 40, 80, fill=1, stroke=0)
         
         c.setFillColor(HexColor('#000000'))
-        c.drawString(30, y_position - 15, f"【原标题】: {item['title']}")
+        c.drawString(30, y - 15, f"【原标题】: {item['title']}")
         
-        line_step = 15
-        current_y = y_position - 30
-        
-        for line in text_lines:
+        current_y = y - 30
+        lines = item['result'].split('\n')
+        for line in lines:
             if line.strip():
                 c.drawString(30, current_y, line.strip())
-                current_y -= line_step
-        
-        y_position -= 100 # 下一条笔记的间距
+                current_y -= 12
+        y -= 100 # 间隔
         
     c.save()
     buffer.seek(0)
     return buffer
 
-# ================= 界面逻辑 =================
+# ================= 4. 主界面逻辑 =================
 
-# 侧边栏
-with st.sidebar:
-    st.header("🔑 设置")
-    api_key = st.text_input("请输入 Google API Key", type="password", help="去 aistudio.google.com 免费申请")
+# 检查登录状态
+if check_auth():
+    # --- 只有登录后才会执行以下代码 ---
+    
+    st.title("🏥 小红书账号 ICU 急救站 (专业版)")
+    
+    # 自动读取 API Key
+    if "GOOGLE_API_KEY" in st.secrets:
+        api_key = st.secrets["GOOGLE_API_KEY"]
+    else:
+        st.error("⚠️ 系统未配置 API Key，请联系管理员")
+        st.stop()
+
+    uploaded_file = st.file_uploader("上传 Excel/CSV 数据表", type=['xlsx', 'csv'])
+
+    if uploaded_file:
+        try:
+            if uploaded_file.name.endswith('.csv'):
+                df = pd.read_csv(uploaded_file)
+            else:
+                df = pd.read_excel(uploaded_file)
+            
+            st.success(f"已加载 {len(df)} 条笔记数据")
+            with st.expander("预览数据"):
+                st.dataframe(df.head())
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                title_col = st.selectbox("哪一列是【标题】?", df.columns)
+            with col2:
+                likes_col = st.selectbox("哪一列是【点赞】?", df.columns)
+            
+            if st.button("🚀 开始智能诊断"):
+                # 配置 AI
+                genai.configure(api_key=api_key)
+                model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=SYSTEM_PROMPT)
+                
+                # 进度条
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                results = []
+                
+                # 限制演示前5条 (正式版可去掉 .head(5) 跑全量)
+                process_df = df.head(5)
+                
+                for idx, row in process_df.iterrows():
+                    status_text.text(f"正在诊断: {row[title_col]}...")
+                    res = analyze_note(model, row[title_col], row[likes_col], "未知")
+                    results.append({"title": row[title_col], "result": res})
+                    progress_bar.progress((idx + 1) / len(process_df))
+                    time.sleep(1) # 防止API过载
+                    
+                status_text.success("诊断完成！")
+                
+                # 结果展示区
+                col_res, col_chart = st.columns([1, 1])
+                
+                with col_chart:
+                    st.subheader("📊 互动趋势")
+                    fig, ax = plt.subplots(figsize=(6, 4))
+                    sns.barplot(x=process_df[likes_col], y=process_df[title_col].str[:8], ax=ax, palette="viridis")
+                    
+                    # 尝试设置字体
+                    font_path = get_chinese_font()
+                    if os.path.exists(font_path):
+                        import matplotlib.font_manager as fm
+                        prop = fm.FontProperties(fname=font_path)
+                        plt.yticks(fontproperties=prop)
+                    
+                    st.pyplot(fig)
+                    # 保存图片供PDF使用
+                    img_buffer = io.BytesIO()
+                    plt.savefig(img_buffer, format='png', bbox_inches='tight', dpi=150)
+
+                with col_res:
+                    st.subheader("💊 诊断详情")
+                    for item in results:
+                        with st.chat_message("assistant"):
+                            st.write(f"**{item['title']}**")
+                            st.text(item['result'])
+                            
+                # PDF 下载
+                pdf_bytes = create_pdf(df, results, img_buffer)
+                st.download_button(
+                    label="📥 下载深度报告 (PDF)",
+                    data=pdf_bytes,
+                    file_name="诊断报告.pdf",
+                    mime="application/pdf"
+                )
+                
+        except Exception as e:
+            st.error(f"处理数据时出错: {e}")
+            
+else:
+    # --- 未登录时的显示页面 ---
+    st.markdown("# 👋 欢迎来到小红书账号急救站")
+    st.info("👈 请在左侧输入今日 **卡密** 解锁使用。")
     st.markdown("---")
-    st.markdown("### 💡 使用说明")
-    st.markdown("1. 上传小红书后台导出的 CSV/Excel")
-    st.markdown("2. 点击开始诊断")
-    st.markdown("3. 等待 AI 分析")
-    st.markdown("4. 下载 PDF 报告")
-
-# 主界面
-st.title("🏥 小红书账号 ICU 急救站")
-st.markdown("##### 几十块钱的咨询太贵？先花 **0元** 用 AI 测测你的标题含金量！")
-
-uploaded_file = st.file_uploader("上传笔记数据表", type=['xlsx', 'csv'])
-
-if uploaded_file and api_key:
-    # 读取文件
-    try:
-        if uploaded_file.name.endswith('.csv'):
-            df = pd.read_csv(uploaded_file)
-        else:
-            df = pd.read_excel(uploaded_file)
-        
-        st.success(f"✅ 成功读取 {len(df)} 条数据")
-        
-        # 数据预览
-        with st.expander("点击查看原始数据"):
-            st.dataframe(df.head())
-        
-        # 必须包含的列名检测 (根据你的Excel调整)
-        title_col = st.selectbox("选择【标题】列", df.columns)
-        likes_col = st.selectbox("选择【点赞】列", df.columns)
-        
-        # 只有点击按钮才开始跑
-        if st.button("🚀 开始全盘扫描 (AI Diagnosis)"):
-            
-            # 1. AI 分析过程
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=SYSTEM_PROMPT)
-            
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            analysis_results = []
-            
-            # 为了演示，只取前 5 条 (你可以自己改成全量)
-            target_df = df.head(5) 
-            
-            for index, row in target_df.iterrows():
-                status_text.text(f"正在诊断第 {index+1} 条: {row[title_col]}...")
-                
-                res_text = analyze_note(model, row[title_col], row[likes_col], "未知")
-                analysis_results.append({
-                    "title": row[title_col],
-                    "result": res_text
-                })
-                
-                progress_bar.progress((index + 1) / len(target_df))
-                time.sleep(1) # 防止 API 速率限制
-            
-            status_text.text("✅ 诊断完成！正在生成报告...")
-            
-            # 2. 生成图表 (用于 PDF)
-            st.subheader("📊 诊断结果可视化")
-            fig, ax = plt.subplots(figsize=(10, 5))
-            # 简单画一个点赞分布图
-            sns.barplot(y=target_df[title_col].str[:10]+"...", x=target_df[likes_col], palette="viridis", ax=ax)
-            
-            # 设置中文字体 (Matplotlib)
-            font_path = get_chinese_font()
-            my_font =  pd.read_csv(io.StringIO(""), sep="\t") # Dummy
-            if os.path.exists(font_path):
-                import matplotlib.font_manager as fm
-                prop = fm.FontProperties(fname=font_path)
-                plt.yticks(fontproperties=prop)
-            
-            plt.title("笔记点赞表现", fontproperties=prop if os.path.exists(font_path) else None)
-            st.pyplot(fig)
-            
-            # 保存图表到内存
-            img_buffer = io.BytesIO()
-            plt.savefig(img_buffer, format='png', dpi=150, bbox_inches='tight')
-            
-            # 3. 展示 AI 建议文本
-            st.subheader("💊 AI 毒舌处方")
-            for res in analysis_results:
-                with st.chat_message("assistant"):
-                    st.write(f"**原标题**: {res['title']}")
-                    st.text(res['result']) # 使用 text 保持格式
-            
-            # 4. 生成 PDF 下载
-            pdf_data = create_pdf(df, analysis_results, img_buffer)
-            
-            st.markdown("---")
-            st.download_button(
-                label="📥 下载深度诊断报告 (.pdf)",
-                data=pdf_data,
-                file_name="小红书账号诊断报告.pdf",
-                mime="application/pdf"
-            )
-
-    except Exception as e:
-        st.error(f"发生错误: {e}")
-
-elif not api_key:
-    st.info("👈 请在左侧输入 API Key 才能开始工作")
+    st.markdown("#### 💡 如何获取卡密？")
+    st.markdown("1. 填写问卷下单")
+    st.markdown("2. 系统自动发货至您的邮箱")
