@@ -12,6 +12,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.colors import HexColor
 import matplotlib.pyplot as plt
 import seaborn as sns
+import matplotlib.font_manager as fm # 引入字体管理模块
 
 # ================= 1. 基础配置 =================
 st.set_page_config(
@@ -39,7 +40,7 @@ def get_valid_codes():
     """从 Secrets 中读取并清洗卡密列表"""
     # 1. 尝试从 Secrets 获取
     if "VALID_CODES" not in st.secrets:
-        st.error("⚠️ 系统配置错误：未找到卡密列表 (VALID_CODES)")
+        st.error("⚠️ 系统配置错误：未找到卡密列表 (VALID_CODES)，请在后台 Secrets 中配置。")
         return []
     
     raw_str = st.secrets["VALID_CODES"]
@@ -70,6 +71,7 @@ def check_auth():
     btn = st.sidebar.button("验证")
     
     if btn:
+        # 获取管理员密码，默认为 admin888
         admin_pwd = st.secrets.get("ADMIN_PASSWORD", "admin888")
         valid_codes = get_valid_codes()
         
@@ -79,7 +81,9 @@ def check_auth():
         if clean_input == admin_pwd:
             st.sidebar.success("👮 管理员认证成功")
             st.sidebar.info(f"当前生效卡密: {len(valid_codes)} 个")
-            # 管理员不自动进系统，只显示信息
+            # 管理员模式下只显示信息，不自动进入，或者你可以取消注释下面两行强制进入
+            # st.session_state.is_logged_in = True
+            # st.rerun()
             
         # 情况B：卡密在列表里
         elif clean_input in valid_codes:
@@ -100,13 +104,15 @@ def get_chinese_font():
     """下载中文字体防止乱码"""
     font_path = "SimHei.ttf"
     if not os.path.exists(font_path):
+        # 使用稳定的 GitHub 源下载字体
         url = "https://github.com/StellarCN/scp_zh/raw/master/fonts/SimHei.ttf"
         try:
-            r = requests.get(url)
-            with open(font_path, "wb") as f:
-                f.write(r.content)
+            with st.spinner("正在初始化字体资源..."):
+                r = requests.get(url)
+                with open(font_path, "wb") as f:
+                    f.write(r.content)
         except:
-            pass
+            st.warning("字体下载失败，可能会导致图表中文显示方框。")
     return font_path
 
 def analyze_note(model, title, likes, ctr):
@@ -185,7 +191,7 @@ if check_auth():
     if "GOOGLE_API_KEY" in st.secrets:
         api_key = st.secrets["GOOGLE_API_KEY"]
     else:
-        st.error("⚠️ 系统未配置 API Key")
+        st.error("⚠️ 系统未配置 API Key，请在 Secrets 中添加 GOOGLE_API_KEY")
         st.stop()
 
     uploaded_file = st.file_uploader("上传 Excel/CSV 数据表", type=['xlsx', 'csv'])
@@ -215,7 +221,7 @@ if check_auth():
                 status_text = st.empty()
                 results = []
                 
-                # 演示前5条 (可自行去掉head)
+                # 默认只取前5条演示 (你可以根据需求删除 .head(5) 以跑全量)
                 process_df = df.head(5)
                 
                 for idx, row in process_df.iterrows():
@@ -231,16 +237,22 @@ if check_auth():
                 
                 with col_chart:
                     st.subheader("📊 互动趋势")
+                    
+                    # === 核心修复：图表字体处理 ===
+                    font_path = get_chinese_font()
+                    if os.path.exists(font_path):
+                        # 强制注册字体到 Matplotlib
+                        fm.fontManager.addfont(font_path)
+                        plt.rcParams['font.family'] = fm.FontProperties(fname=font_path).get_name()
+                    plt.rcParams['axes.unicode_minus'] = False # 解决负号显示
+                    # ===========================
+
                     fig, ax = plt.subplots(figsize=(6, 4))
                     sns.barplot(x=process_df[likes_col], y=process_df[title_col].str[:8], ax=ax, palette="viridis")
                     
-                    font_path = get_chinese_font()
-                    if os.path.exists(font_path):
-                        import matplotlib.font_manager as fm
-                        prop = fm.FontProperties(fname=font_path)
-                        plt.yticks(fontproperties=prop)
-                    
                     st.pyplot(fig)
+                    
+                    # 保存图片到内存 (供PDF使用)
                     img_buffer = io.BytesIO()
                     plt.savefig(img_buffer, format='png', bbox_inches='tight', dpi=150)
 
@@ -260,7 +272,7 @@ if check_auth():
                 )
                 
         except Exception as e:
-            st.error(f"出错: {e}")
+            st.error(f"处理数据时出错: {e}")
 else:
     st.markdown("# 👋 欢迎来到小红书账号急救站")
     st.info("👈 请在左侧输入今日 **卡密** 解锁使用。")
