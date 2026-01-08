@@ -5,8 +5,6 @@ import time
 import io
 import os
 import requests
-import hashlib
-import datetime
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
@@ -35,19 +33,21 @@ SYSTEM_PROMPT = """
 【改写方案B】: <利益型标题>
 """
 
-# ================= 2. 安全与授权模块 (核心) =================
+# ================= 2. 验证逻辑 (从Secret读取) =================
 
-def get_daily_token():
-    """生成今日动态卡密 (算法：MD5(盐值 + 日期))"""
-    if "SECRET_SALT" not in st.secrets:
-        st.error("配置错误：请在 Secrets 中设置 SECRET_SALT")
-        return None
-        
-    salt = st.secrets["SECRET_SALT"]
-    today = datetime.datetime.now().strftime("%Y%m%d")
-    raw = f"{salt}{today}"
-    # 取哈希的前6位作为卡密
-    return hashlib.md5(raw.encode()).hexdigest()[:6]
+def get_valid_codes():
+    """从 Secrets 中读取并清洗卡密列表"""
+    # 1. 尝试从 Secrets 获取
+    if "VALID_CODES" not in st.secrets:
+        st.error("⚠️ 系统配置错误：未找到卡密列表 (VALID_CODES)")
+        return []
+    
+    raw_str = st.secrets["VALID_CODES"]
+    
+    # 2. 清洗数据：把换行符换成逗号，然后分割
+    cleaned_str = raw_str.replace('\n', ',')
+    code_list = [code.strip() for code in cleaned_str.split(',') if code.strip()]
+    return code_list
 
 def check_auth():
     """处理侧边栏登录逻辑"""
@@ -66,42 +66,40 @@ def check_auth():
         return True
 
     # 如果未登录，显示输入框
-    user_input = st.sidebar.text_input("请输入今日卡密", type="password", help="请联系管理员获取")
+    user_input = st.sidebar.text_input("请输入卡密 / 激活码", type="password", help="请填写您购买的卡密")
     btn = st.sidebar.button("验证")
     
     if btn:
-        admin_pwd = st.secrets.get("ADMIN_PASSWORD", "admin")
-        daily_token = get_daily_token()
+        admin_pwd = st.secrets.get("ADMIN_PASSWORD", "admin888")
+        valid_codes = get_valid_codes()
         
-        # 情况A：管理员登录 (显示今日卡密)
-        if user_input == admin_pwd:
+        clean_input = user_input.strip()
+        
+        # 情况A：管理员登录
+        if clean_input == admin_pwd:
             st.sidebar.success("👮 管理员认证成功")
-            st.sidebar.markdown("### 🔑 今日卡密 (请复制给用户):")
-            st.sidebar.code(daily_token, language="text")
-            # 管理员也可以选择直接进入系统
-            # st.session_state.is_logged_in = True
-            # st.rerun()
+            st.sidebar.info(f"当前生效卡密: {len(valid_codes)} 个")
+            # 管理员不自动进系统，只显示信息
             
-        # 情况B：用户使用卡密登录
-        elif user_input == daily_token:
+        # 情况B：卡密在列表里
+        elif clean_input in valid_codes:
             st.session_state.is_logged_in = True
             st.sidebar.success("验证成功！")
             st.rerun()
             
-        # 情况C：密码错误
+        # 情况C：无效
         else:
-            st.sidebar.error("❌ 卡密无效或已过期")
+            st.sidebar.error("❌ 无效的卡密，请检查输入")
             
     return False
 
-# ================= 3. 辅助功能 (字体/PDF/AI) =================
+# ================= 3. 辅助功能 =================
 
 @st.cache_resource
 def get_chinese_font():
     """下载中文字体防止乱码"""
     font_path = "SimHei.ttf"
     if not os.path.exists(font_path):
-        # 使用一个开源字体链接
         url = "https://github.com/StellarCN/scp_zh/raw/master/fonts/SimHei.ttf"
         try:
             r = requests.get(url)
@@ -161,10 +159,8 @@ def create_pdf(df, analysis_results, charts_buffer):
             c.setFont(font_name, 10)
             y = height - 50
             
-        # 绘制背景块
         c.setFillColor(HexColor('#F5F5F5'))
         c.rect(20, y - 70, width - 40, 80, fill=1, stroke=0)
-        
         c.setFillColor(HexColor('#000000'))
         c.drawString(30, y - 15, f"【原标题】: {item['title']}")
         
@@ -174,25 +170,22 @@ def create_pdf(df, analysis_results, charts_buffer):
             if line.strip():
                 c.drawString(30, current_y, line.strip())
                 current_y -= 12
-        y -= 100 # 间隔
+        y -= 100
         
     c.save()
     buffer.seek(0)
     return buffer
 
-# ================= 4. 主界面逻辑 =================
+# ================= 4. 主程序入口 =================
 
 # 检查登录状态
 if check_auth():
-    # --- 只有登录后才会执行以下代码 ---
-    
     st.title("🏥 小红书账号 ICU 急救站 (专业版)")
     
-    # 自动读取 API Key
     if "GOOGLE_API_KEY" in st.secrets:
         api_key = st.secrets["GOOGLE_API_KEY"]
     else:
-        st.error("⚠️ 系统未配置 API Key，请联系管理员")
+        st.error("⚠️ 系统未配置 API Key")
         st.stop()
 
     uploaded_file = st.file_uploader("上传 Excel/CSV 数据表", type=['xlsx', 'csv'])
@@ -215,16 +208,14 @@ if check_auth():
                 likes_col = st.selectbox("哪一列是【点赞】?", df.columns)
             
             if st.button("🚀 开始智能诊断"):
-                # 配置 AI
                 genai.configure(api_key=api_key)
                 model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=SYSTEM_PROMPT)
                 
-                # 进度条
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 results = []
                 
-                # 限制演示前5条 (正式版可去掉 .head(5) 跑全量)
+                # 演示前5条 (可自行去掉head)
                 process_df = df.head(5)
                 
                 for idx, row in process_df.iterrows():
@@ -232,11 +223,10 @@ if check_auth():
                     res = analyze_note(model, row[title_col], row[likes_col], "未知")
                     results.append({"title": row[title_col], "result": res})
                     progress_bar.progress((idx + 1) / len(process_df))
-                    time.sleep(1) # 防止API过载
+                    time.sleep(1)
                     
                 status_text.success("诊断完成！")
                 
-                # 结果展示区
                 col_res, col_chart = st.columns([1, 1])
                 
                 with col_chart:
@@ -244,7 +234,6 @@ if check_auth():
                     fig, ax = plt.subplots(figsize=(6, 4))
                     sns.barplot(x=process_df[likes_col], y=process_df[title_col].str[:8], ax=ax, palette="viridis")
                     
-                    # 尝试设置字体
                     font_path = get_chinese_font()
                     if os.path.exists(font_path):
                         import matplotlib.font_manager as fm
@@ -252,7 +241,6 @@ if check_auth():
                         plt.yticks(fontproperties=prop)
                     
                     st.pyplot(fig)
-                    # 保存图片供PDF使用
                     img_buffer = io.BytesIO()
                     plt.savefig(img_buffer, format='png', bbox_inches='tight', dpi=150)
 
@@ -263,7 +251,6 @@ if check_auth():
                             st.write(f"**{item['title']}**")
                             st.text(item['result'])
                             
-                # PDF 下载
                 pdf_bytes = create_pdf(df, results, img_buffer)
                 st.download_button(
                     label="📥 下载深度报告 (PDF)",
@@ -273,10 +260,8 @@ if check_auth():
                 )
                 
         except Exception as e:
-            st.error(f"处理数据时出错: {e}")
-            
+            st.error(f"出错: {e}")
 else:
-    # --- 未登录时的显示页面 ---
     st.markdown("# 👋 欢迎来到小红书账号急救站")
     st.info("👈 请在左侧输入今日 **卡密** 解锁使用。")
     st.markdown("---")
