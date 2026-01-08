@@ -1,10 +1,10 @@
 import streamlit as st
 import pandas as pd
-import google.generativeai as genai
 import time
 import io
 import os
-import requests
+import requests # 我们现在主要靠这个库
+import json
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
@@ -12,7 +12,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.colors import HexColor
 import matplotlib.pyplot as plt
 import seaborn as sns
-import matplotlib.font_manager as fm # 引入字体管理模块
+import matplotlib.font_manager as fm
 
 # ================= 1. 基础配置 =================
 st.set_page_config(
@@ -34,18 +34,14 @@ SYSTEM_PROMPT = """
 【改写方案B】: <利益型标题>
 """
 
-# ================= 2. 验证逻辑 (从Secret读取) =================
+# ================= 2. 验证逻辑 =================
 
 def get_valid_codes():
     """从 Secrets 中读取并清洗卡密列表"""
-    # 1. 尝试从 Secrets 获取
     if "VALID_CODES" not in st.secrets:
-        st.error("⚠️ 系统配置错误：未找到卡密列表 (VALID_CODES)，请在后台 Secrets 中配置。")
+        st.error("⚠️ 配置错误：未找到 VALID_CODES，请检查 Secrets。")
         return []
-    
     raw_str = st.secrets["VALID_CODES"]
-    
-    # 2. 清洗数据：把换行符换成逗号，然后分割
     cleaned_str = raw_str.replace('\n', ',')
     code_list = [code.strip() for code in cleaned_str.split(',') if code.strip()]
     return code_list
@@ -53,12 +49,9 @@ def get_valid_codes():
 def check_auth():
     """处理侧边栏登录逻辑"""
     st.sidebar.header("🔐 会员登录")
-    
-    # 初始化登录状态
     if "is_logged_in" not in st.session_state:
         st.session_state.is_logged_in = False
     
-    # 如果已登录，显示状态和退出按钮
     if st.session_state.is_logged_in:
         st.sidebar.success("✅ 已验证身份")
         if st.sidebar.button("退出登录"):
@@ -66,35 +59,22 @@ def check_auth():
             st.rerun()
         return True
 
-    # 如果未登录，显示输入框
-    user_input = st.sidebar.text_input("请输入卡密 / 激活码", type="password", help="请填写您购买的卡密")
+    user_input = st.sidebar.text_input("请输入卡密 / 激活码", type="password")
     btn = st.sidebar.button("验证")
     
     if btn:
-        # 获取管理员密码，默认为 admin888
         admin_pwd = st.secrets.get("ADMIN_PASSWORD", "admin888")
         valid_codes = get_valid_codes()
-        
         clean_input = user_input.strip()
         
-        # 情况A：管理员登录
         if clean_input == admin_pwd:
-            st.sidebar.success("👮 管理员认证成功")
-            st.sidebar.info(f"当前生效卡密: {len(valid_codes)} 个")
-            # 管理员模式下只显示信息，不自动进入，或者你可以取消注释下面两行强制进入
-            # st.session_state.is_logged_in = True
-            # st.rerun()
-            
-        # 情况B：卡密在列表里
+            st.sidebar.success(f"👮 管理员认证成功 (生效卡密: {len(valid_codes)}个)")
         elif clean_input in valid_codes:
             st.session_state.is_logged_in = True
             st.sidebar.success("验证成功！")
             st.rerun()
-            
-        # 情况C：无效
         else:
-            st.sidebar.error("❌ 无效的卡密，请检查输入")
-            
+            st.sidebar.error("❌ 无效的卡密")
     return False
 
 # ================= 3. 辅助功能 =================
@@ -104,7 +84,6 @@ def get_chinese_font():
     """下载中文字体防止乱码"""
     font_path = "SimHei.ttf"
     if not os.path.exists(font_path):
-        # 使用稳定的 GitHub 源下载字体
         url = "https://github.com/StellarCN/scp_zh/raw/master/fonts/SimHei.ttf"
         try:
             with st.spinner("正在初始化字体资源..."):
@@ -112,17 +91,52 @@ def get_chinese_font():
                 with open(font_path, "wb") as f:
                     f.write(r.content)
         except:
-            st.warning("字体下载失败，可能会导致图表中文显示方框。")
+            st.warning("字体下载失败，图表可能显示方框。")
     return font_path
 
-def analyze_note(model, title, likes, ctr):
-    """调用 API 分析"""
-    prompt = f"笔记标题：{title}\n数据：点赞 {likes}, 点击率 {ctr}\n请诊断。"
+# 🔥🔥🔥 核心修改：使用 Requests 直接调用第三方 API 🔥🔥🔥
+def analyze_note(api_key, title, likes, ctr):
+    """
+    不再使用 google.generativeai 库，
+    而是直接向 api.gptsapi.net 发送 HTTP 请求。
+    """
+    # 你的第三方中转地址 (Gemini 1.5 Flash)
+    url = f"https://api.gptsapi.net/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+    
+    # 构造请求头
+    headers = {'Content-Type': 'application/json'}
+    
+    # 构造提示词内容
+    user_prompt = f"笔记标题：{title}\n数据：点赞 {likes}, 点击率 {ctr}\n请诊断。"
+    
+    # 构造 JSON 数据包 (完全符合 Gemini 官方格式)
+    payload = {
+        "system_instruction": {
+            "parts": {"text": SYSTEM_PROMPT}
+        },
+        "contents": [{
+            "parts": [{"text": user_prompt}]
+        }]
+    }
+
     try:
-        response = model.generate_content(prompt)
-        return response.text
+        # 发送请求
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        
+        # 解析结果
+        if response.status_code == 200:
+            result_json = response.json()
+            # 提取文本内容
+            try:
+                text = result_json['candidates'][0]['content']['parts'][0]['text']
+                return text
+            except:
+                return f"解析失败: {response.text}"
+        else:
+            return f"API请求失败 (Code {response.status_code}): {response.text}"
+            
     except Exception as e:
-        return f"AI 响应错误: {str(e)}"
+        return f"连接错误: {str(e)}"
 
 def create_pdf(df, analysis_results, charts_buffer):
     """生成 PDF 报告"""
@@ -184,14 +198,14 @@ def create_pdf(df, analysis_results, charts_buffer):
 
 # ================= 4. 主程序入口 =================
 
-# 检查登录状态
 if check_auth():
-    st.title("🏥 小红书账号 ICU 急救站 (专业版)")
+    st.title("🏥 小红书账号 ICU 急救站 (第三方API版)")
     
+    # 读取 Key
     if "GOOGLE_API_KEY" in st.secrets:
         api_key = st.secrets["GOOGLE_API_KEY"]
     else:
-        st.error("⚠️ 系统未配置 API Key，请在 Secrets 中添加 GOOGLE_API_KEY")
+        st.error("⚠️ 未配置 GOOGLE_API_KEY")
         st.stop()
 
     uploaded_file = st.file_uploader("上传 Excel/CSV 数据表", type=['xlsx', 'csv'])
@@ -214,22 +228,22 @@ if check_auth():
                 likes_col = st.selectbox("哪一列是【点赞】?", df.columns)
             
             if st.button("🚀 开始智能诊断"):
-                genai.configure(api_key=api_key)
-                model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=SYSTEM_PROMPT)
                 
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 results = []
-                
-                # 默认只取前5条演示 (你可以根据需求删除 .head(5) 以跑全量)
-                process_df = df.head(5)
+                process_df = df.head(5) # 演示前5条
                 
                 for idx, row in process_df.iterrows():
                     status_text.text(f"正在诊断: {row[title_col]}...")
-                    res = analyze_note(model, row[title_col], row[likes_col], "未知")
+                    
+                    # 🔥 调用修改后的分析函数，传入 api_key
+                    res = analyze_note(api_key, row[title_col], row[likes_col], "未知")
+                    
                     results.append({"title": row[title_col], "result": res})
                     progress_bar.progress((idx + 1) / len(process_df))
-                    time.sleep(1)
+                    # 这里的sleep可以适当减少，因为第三方并发可能高一点，但保险起见留着
+                    time.sleep(0.5) 
                     
                 status_text.success("诊断完成！")
                 
@@ -238,21 +252,17 @@ if check_auth():
                 with col_chart:
                     st.subheader("📊 互动趋势")
                     
-                    # === 核心修复：图表字体处理 ===
+                    # 字体修复
                     font_path = get_chinese_font()
                     if os.path.exists(font_path):
-                        # 强制注册字体到 Matplotlib
                         fm.fontManager.addfont(font_path)
                         plt.rcParams['font.family'] = fm.FontProperties(fname=font_path).get_name()
-                    plt.rcParams['axes.unicode_minus'] = False # 解决负号显示
-                    # ===========================
+                    plt.rcParams['axes.unicode_minus'] = False 
 
                     fig, ax = plt.subplots(figsize=(6, 4))
                     sns.barplot(x=process_df[likes_col], y=process_df[title_col].str[:8], ax=ax, palette="viridis")
-                    
                     st.pyplot(fig)
                     
-                    # 保存图片到内存 (供PDF使用)
                     img_buffer = io.BytesIO()
                     plt.savefig(img_buffer, format='png', bbox_inches='tight', dpi=150)
 
@@ -272,11 +282,7 @@ if check_auth():
                 )
                 
         except Exception as e:
-            st.error(f"处理数据时出错: {e}")
+            st.error(f"出错: {e}")
 else:
     st.markdown("# 👋 欢迎来到小红书账号急救站")
-    st.info("👈 请在左侧输入今日 **卡密** 解锁使用。")
-    st.markdown("---")
-    st.markdown("#### 💡 如何获取卡密？")
-    st.markdown("1. 填写问卷下单")
-    st.markdown("2. 系统自动发货至您的邮箱")
+    st.info("👈 请在左侧输入卡密解锁。")
