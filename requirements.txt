@@ -1,0 +1,8 @@
+streamlit
+pandas
+google-generativeai
+reportlab
+matplotlib
+seaborn
+openpyxl
+requests
